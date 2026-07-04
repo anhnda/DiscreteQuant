@@ -20,6 +20,7 @@ from eigenflip.encoders.shrinkage import ShrinkageGPTQ
 from eigenflip.encoders.tfic import TFICEncoder
 from eigenflip.encoders.tfic_fast import TFICEncoder as TFICEncoderFast
 from eigenflip.encoders.tfica_fast import TFICAEncoder
+from eigenflip.encoders.flexround import FlexRoundEncoder
 from eigenflip.encoders.gptaq import GPTAQEncoder
 from eigenflip.encoders.gptaq_tfic import GPTAQTFICEncoder
 from eigenflip.statistics.collect_asym import collect_and_encode_asym
@@ -35,9 +36,9 @@ NEED_H = {"none": False, "clc": False,
           "eigenflip": True, "eigenflip_solve": True,
           "gptq": True, "shr_gptq_cov": True, "shr_gptq_2m": True,
           "tfic": True, "tfic_fast": True, "tfica_fast": True,
-          "gptaq": True, "gptaq_tfic": True}
+          "gptaq": True, "gptaq_tfic": True, "flexround": True}
 KEEP_SIGMA = {"gptq", "shr_gptq_cov", "shr_gptq_2m", "tfic", "tfic_fast",
-              "tfica_fast", "gptaq", "gptaq_tfic"}
+              "tfica_fast", "gptaq", "gptaq_tfic", "flexround"}
 
 
 def build_encoder(name, args):
@@ -63,6 +64,9 @@ def build_encoder(name, args):
         gamma_th=args.tfic_gamma, kappa=args.tfic_kappa, gmax=args.tfic_gmax,
         n_stages=args.tfic_stages, sweeps=args.tfic_sweeps,
         c_cand=args.tfic_ccand, top_m=args.tfic_topm, chunk_cols=args.tfic_chunk)
+    if name == "flexround": return FlexRoundEncoder(
+        iters=args.flex_iters, lr=args.flex_lr,
+        use_s3=not args.flex_no_s3)
     if name == "gptaq": return GPTAQEncoder(
         damp=args.gptq_damp, alpha=args.asym_alpha)
     if name == "gptaq_tfic": return GPTAQTFICEncoder(
@@ -111,6 +115,12 @@ def main():
     p.add_argument("--tfic-ccand", type=float, default=8.0)
     p.add_argument("--tfic-topm", type=int, default=32)
     p.add_argument("--tfic-chunk", type=int, default=256)
+    p.add_argument("--flex-iters", type=int, default=300,
+                   help="Adam steps per layer for FlexRound reconstruction.")
+    p.add_argument("--flex-lr", type=float, default=1e-3,
+                   help="Adam learning rate for FlexRound params (s1,S2,s3).")
+    p.add_argument("--flex-no-s3", action="store_true",
+                   help="drop the per-output-channel s3 term (paper ablation 2).")
     p.add_argument("--asym", action="store_true",
                    help="GPTAQ-style block-causal collection that streams the "
                         "cross-Gram (encoder tfica_fast/gptaq/gptaq_tfic).")
