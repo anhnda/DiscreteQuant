@@ -133,50 +133,56 @@ class FlexRoundEncoder:
         min_int = float(state.min_int)
         C, pin = Wf.shape
 
-        # ---- learnable FlexRound parameters (log-space divisor) -----------
-        # delta1 = log(s1): start from the base grid size so we begin at RTN.
-        delta1 = torch.log(scale.clamp_min(1e-8)).detach().clone().requires_grad_(True)
-        # delta2 = S2 (element-wise), init 0  -> exp offset 1.
-        delta2 = torch.zeros_like(Wf).requires_grad_(True)
-        params = [delta1, delta2]
-        if self.use_s3:
-            # delta3 = s3, per-output-channel [C, 1], init 0.
-            delta3 = torch.zeros(C, 1, device=dev, dtype=wdt).requires_grad_(True)
-            params.append(delta3)
-        else:
-            delta3 = None
-
-        opt = torch.optim.Adam(params, lr=self.lr)
-
-        # RTN baseline energy for diagnostics: R0 = (round(W/s+zp)-zp)*s - W
+        # ---- RTN baseline energy for diagnostics --------------------------
+        # R0 = (round(W/s+zp)-zp)*s - W   (the plain base residual)
         with torch.no_grad():
             q0 = torch.round(Wf / scale + zp).clamp(min_int, max_int)
             R0 = (q0 - zp) * scale - Wf
             e_rtn = (R0 @ G * R0).sum().item()
             del q0, R0
 
-        # ---- optimize Tr(R G R^T) with STE rounding -----------------------
-        for _ in range(self.iters):
-            opt.zero_grad(set_to_none=True)
+        # ---- learnable FlexRound parameters + optimization ----------------
+        # The pipeline calls encoders inside a @torch.no_grad() collector, so we
+        # must explicitly re-enable autograd: FlexRound is the one encoder that
+        # backprops. Params are created *inside* enable_grad so requires_grad
+        # actually sticks.
+        with torch.enable_grad():
+            # delta1 = log(s1): start from the base grid size so we begin at RTN.
+            delta1 = torch.log(scale.clamp_min(1e-8)).detach().clone().requires_grad_(True)
+            # delta2 = S2 (element-wise), init 0  -> exp offset 1.
+            delta2 = torch.zeros_like(Wf).detach().requires_grad_(True)
+            params = [delta1, delta2]
+            if self.use_s3:
+                # delta3 = s3, per-output-channel [C, 1], init 0.
+                delta3 = torch.zeros(C, 1, device=dev, dtype=wdt).requires_grad_(True)
+                params.append(delta3)
+            else:
+                delta3 = None
 
-            log_div = delta1 + delta2
-            if delta3 is not None:
-                log_div = log_div + delta3
-            divisor = torch.exp(log_div)                  # s1 . S2 . s3  > 0
-            s1 = torch.exp(delta1)                         # common grid size
+            opt = torch.optim.Adam(params, lr=self.lr)
 
-            x_int = _round_ste(Wf / divisor)              # round(W / (s1 S2 s3))
-            if self.clamp_codes:
-                # keep the same code range as the base; zero_point-centred so the
-                # clamp bounds match dequantize()'s [min_int, max_int] on codes.
-                x_int = torch.clamp(x_int + zp, min_int, max_int) - zp
-            W_hat = x_int * s1                            # dequant = q * s1  (paper Eq. 1)
+            # ---- optimize Tr(R G R^T) with STE rounding -------------------
+            for _ in range(self.iters):
+                opt.zero_grad(set_to_none=True)
 
-            R = W_hat - Wf                               # [C, pin]
-            loss = (R @ G * R).sum()                     # Tr(R G R^T), n-scaled
+                log_div = delta1 + delta2
+                if delta3 is not None:
+                    log_div = log_div + delta3
+                divisor = torch.exp(log_div)              # s1 . S2 . s3  > 0
+                s1 = torch.exp(delta1)                     # common grid size
 
-            loss.backward()
-            opt.step()
+                x_int = _round_ste(Wf / divisor)          # round(W / (s1 S2 s3))
+                if self.clamp_codes:
+                    # keep the base code range; zero_point-centred so the clamp
+                    # bounds match dequantize()'s [min_int, max_int] on codes.
+                    x_int = torch.clamp(x_int + zp, min_int, max_int) - zp
+                W_hat = x_int * s1                        # dequant = q * s1 (Eq. 1)
+
+                R = W_hat - Wf                           # [C, pin]
+                loss = (R @ G * R).sum()                 # Tr(R G R^T), n-scaled
+
+                loss.backward()
+                opt.step()
 
         # ---- commit corrected weights (no grad) ---------------------------
         with torch.no_grad():
