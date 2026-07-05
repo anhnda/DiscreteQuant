@@ -21,7 +21,6 @@ from eigenflip.encoders.tfic import TFICEncoder
 from eigenflip.encoders.tfic_fast import TFICEncoder as TFICEncoderFast
 from eigenflip.encoders.tfica_fast import TFICAEncoder
 from eigenflip.encoders.flexround import FlexRoundEncoder
-from eigenflip.encoders.flexroundreal import FlexRoundRealEncoder
 from eigenflip.encoders.gptaq import GPTAQEncoder
 from eigenflip.encoders.gptaq_tfic import GPTAQTFICEncoder
 from eigenflip.statistics.collect_asym import collect_and_encode_asym
@@ -37,10 +36,9 @@ NEED_H = {"none": False, "clc": False,
           "eigenflip": True, "eigenflip_solve": True,
           "gptq": True, "shr_gptq_cov": True, "shr_gptq_2m": True,
           "tfic": True, "tfic_fast": True, "tfica_fast": True,
-          "gptaq": True, "gptaq_tfic": True, "flexround": True,
-          "flexroundreal": True}
+          "gptaq": True, "gptaq_tfic": True, "flexround": True}
 KEEP_SIGMA = {"gptq", "shr_gptq_cov", "shr_gptq_2m", "tfic", "tfic_fast",
-              "tfica_fast", "gptaq", "gptaq_tfic", "flexround", "flexroundreal"}
+              "tfica_fast", "gptaq", "gptaq_tfic", "flexround"}
 
 
 def build_encoder(name, args):
@@ -69,9 +67,6 @@ def build_encoder(name, args):
     if name == "flexround": return FlexRoundEncoder(
         iters=args.flex_iters, lr=args.flex_lr,
         use_s3=not args.flex_no_s3)
-    if name == "flexroundreal": return FlexRoundRealEncoder(
-        iters=args.flex_iters, lr=args.flex_lr,
-        use_s3=not args.flex_no_s3, cross_weight=args.flexreal_cross)
     if name == "gptaq": return GPTAQEncoder(
         damp=args.gptq_damp, alpha=args.asym_alpha)
     if name == "gptaq_tfic": return GPTAQTFICEncoder(
@@ -126,9 +121,6 @@ def main():
                    help="Adam learning rate for FlexRound params (s1,S2,s3).")
     p.add_argument("--flex-no-s3", action="store_true",
                    help="drop the per-output-channel s3 term (paper ablation 2).")
-    p.add_argument("--flexreal-cross", type=float, default=1.0,
-                   help="sequential cross-term weight for flexroundreal "
-                        "(1.0 = exact ||WX - W_hat X~||^2; 0.0 = layer-wise).")
     p.add_argument("--asym", action="store_true",
                    help="GPTAQ-style block-causal collection that streams the "
                         "cross-Gram (encoder tfica_fast/gptaq/gptaq_tfic).")
@@ -190,10 +182,8 @@ def main():
 
     print(f"base={args.base} encoder={args.encoder} need_H={need_H} k={args.k}")
     if args.asym:
-        if args.encoder not in ("tfica_fast", "gptaq", "gptaq_tfic",
-                                 "flexroundreal"):
-            raise ValueError("--asym requires encoder tfica_fast/gptaq/"
-                             "gptaq_tfic/flexroundreal")
+        if args.encoder not in ("tfica_fast", "gptaq", "gptaq_tfic"):
+            raise ValueError("--asym requires encoder tfica_fast/gptaq/gptaq_tfic")
         print(f"  [asym] block-causal asymmetric collection (GPTAQ-style), "
               f"encoder={args.encoder} alpha={args.asym_alpha}")
         # These encoders consume only Sigma (+ cross-Gram); none reads top-k
