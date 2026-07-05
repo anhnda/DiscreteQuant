@@ -479,18 +479,24 @@ class FlexRoundREM:
             self._set_sub(block, name, swapUniformQ(lin, **wq))
         return block
 
-    def dequantizeBlock(self, block):
+    def dequantizeBlock(self, block, out_dtype=torch.float16):
         for name in self._linear_names(block):
             m = self._get_sub(block, name)
             if isinstance(m, INTLinear):
-                qw = m.weight_quantizer(m.org_weight).clone().detach()
+                # weight_quantizer(org_weight) may upcast to fp32 (delta params
+                # are fp32); force the deployed weight/bias to out_dtype so the
+                # whole block is a single dtype for downstream caching + save.
+                qw = m.weight_quantizer(m.org_weight).clone().detach().to(out_dtype)
                 new_lin = nn.Linear(m.org_weight.shape[1], m.org_weight.shape[0],
                                     bias=(m.bias is not None))
                 new_lin.weight = nn.Parameter(qw, requires_grad=False)
                 if m.bias is not None:
-                    new_lin.bias = nn.Parameter(m.bias.detach().clone(),
-                                                requires_grad=False)
+                    new_lin.bias = nn.Parameter(
+                        m.bias.detach().clone().to(out_dtype), requires_grad=False)
                 self._set_sub(block, name, new_lin.to(qw.device))
+        # cast the rest of the block (layernorms etc.) to the same dtype so the
+        # entire decoder layer is uniformly out_dtype.
+        block = block.to(out_dtype)
         return block
 
     @staticmethod
@@ -635,7 +641,7 @@ class FlexRoundREM:
 
             # 4. reconstruct  5. dequantize (in place)
             block = self.blockReconstruction(block, cached)
-            block = self.dequantizeBlock(block.half())
+            block = self.dequantizeBlock(block, out_dtype=torch.float16)
 
             # write dequantized linears back into self.model, on CPU (model
             # lives on CPU; only the active block is transiently on GPU).
