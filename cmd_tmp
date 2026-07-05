@@ -133,6 +133,7 @@ Wrote ./quantized_models/gptaq_llama3_3bit/rtn_gptaq/ppl.json
     ./quantized_models/gptaq_llama3_3bit/rtn_gptaq_ppl.json
 >>> [3/3] deleting ./quantized_models/gptaq_llama3_3bit/rtn_gptaq
 <<< done rtn+gptaq
+
 SUMMARY  rtn_flexround  wikitext2=7.7128 | c4=10.0478
 Wrote ./quantized_models/flexround_llama3_3bit/rtn_flexround/ppl.json
 >>> [2.5] preserving ppl.json
