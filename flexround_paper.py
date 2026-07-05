@@ -303,6 +303,28 @@ class StopForwardException(Exception):
     pass
 
 
+def _cast_kwargs(kw, device, dtype):
+    """Move captured block kwargs to device and cast float tensors / rotary
+    embeddings to `dtype`. Batch is untouched (caching runs one sample at a
+    time). Integer tensors (position_ids, cache_position) keep their dtype."""
+    out = {}
+    for k, v in kw.items():
+        if v is None:
+            out[k] = None
+        elif k == 'position_embeddings' and isinstance(v, (tuple, list)):
+            out[k] = tuple(
+                (t.to(device=device, dtype=dtype) if torch.is_tensor(t) else t)
+                for t in v)
+        elif torch.is_tensor(v):
+            if v.is_floating_point():
+                out[k] = v.to(device=device, dtype=dtype)
+            else:
+                out[k] = v.to(device)
+        else:
+            out[k] = v
+    return out
+
+
 class _CacheWrapper(nn.Module):
     """Runs the wrapped block, stashes (inp, kwargs, out), then stops forward."""
     def __init__(self, module):
@@ -312,9 +334,14 @@ class _CacheWrapper(nn.Module):
         self.out_data = None
         self.other_data = None
 
-    def forward(self, inp, **other):
+    def forward(self, inp, *args, **other):
         self.inp_data = inp
-        out = self.module(inp, **other)
+        if args:
+            # LlamaModel calls decoder layers with hidden_states positional and
+            # everything else as kwargs; positional extras would break replay.
+            print(f"  [warn] block called with {len(args)} positional extra "
+                  f"args; kwargs replay may be incomplete.")
+        out = self.module(inp, *args, **other)
         self.out_data = out
         self.other_data = other
         raise StopForwardException
@@ -365,11 +392,11 @@ class CachedDataset(Dataset):
         self.cached_fp_input = self.cached_fp_output
         self.cached_fp_output = []
         fp_block = fp_block.to(self.device)
+        bdt = next(fp_block.parameters()).dtype
         with torch.no_grad():
             for i in range(num_samples):
-                x = self.cached_fp_input[i].to(self.device)
-                kw = {k: (v.to(self.device) if torch.is_tensor(v) else v)
-                      for k, v in self.cached_fp_other[i].items()}
+                x = self.cached_fp_input[i].to(device=self.device, dtype=bdt)
+                kw = _cast_kwargs(self.cached_fp_other[i], self.device, bdt)
                 out = fp_block(x, **kw)
                 out = out[0] if isinstance(out, tuple) else out
                 self.cached_fp_output.append(out.detach().to(self.device))
@@ -380,11 +407,11 @@ class CachedDataset(Dataset):
         """Advance the dirty stream through the just-quantized block."""
         new_q = []
         q_block = q_block.to(self.device)
+        bdt = next(q_block.parameters()).dtype
         with torch.no_grad():
             for i in range(num_samples):
-                x = self.cached_q_input[i].to(self.device)
-                kw = {k: (v.to(self.device) if torch.is_tensor(v) else v)
-                      for k, v in self.cached_fp_other[i].items()}
+                x = self.cached_q_input[i].to(device=self.device, dtype=bdt)
+                kw = _cast_kwargs(self.cached_fp_other[i], self.device, bdt)
                 out = q_block(x, **kw)
                 out = out[0] if isinstance(out, tuple) else out
                 new_q.append(out.detach().to(self.device))
@@ -466,8 +493,46 @@ class FlexRoundREM:
                 self._set_sub(block, name, new_lin.to(qw.device))
         return block
 
+    @staticmethod
+    def _prep_kwargs(kw, batch_size, dtype, device):
+        """Normalize captured block kwargs to a target batch size / dtype /
+        device. Fixes (a) batch mismatch: kwargs are captured at batch=1 but the
+        recon dataloader uses batch>=2; (b) dtype mismatch: rotary cos/sin and
+        float masks are captured in fp16 while the block runs in fp32.
+
+        Rules:
+          * position_ids / cache_position  -> move to device, keep [1, seq]
+            (broadcasts across batch) — leave batch as-is.
+          * attention_mask: None stays None; a float/additive mask is cast to the
+            block dtype; if it has an explicit batch dim of 1 and batch_size>1,
+            it is expanded so it never shape-clashes.
+          * position_embeddings (cos, sin) tuple: cast to block dtype + device.
+          * any other tensor: move to device (dtype left untouched).
+        """
+        out = {}
+        for k, v in kw.items():
+            if v is None:
+                out[k] = None
+            elif k == 'position_embeddings' and isinstance(v, (tuple, list)):
+                out[k] = tuple(
+                    (t.to(device=device, dtype=dtype) if torch.is_tensor(t) else t)
+                    for t in v)
+            elif k == 'attention_mask' and torch.is_tensor(v):
+                m = v.to(device)
+                if m.is_floating_point():
+                    m = m.to(dtype)
+                if m.dim() >= 1 and m.size(0) == 1 and batch_size > 1:
+                    m = m.expand(batch_size, *m.shape[1:])
+                out[k] = m
+            elif torch.is_tensor(v):
+                out[k] = v.to(device)
+            else:
+                out[k] = v
+        return out
+
     def blockReconstruction(self, block_q, dataset):
         device = self.device
+        block_dtype = next(block_q.parameters()).dtype
         w_para = []
         for _, module in block_q.named_modules():
             if isinstance(module, UniformAffineQuantizer):
@@ -501,11 +566,13 @@ class FlexRoundREM:
                     cur_inp = mask * cur_fp_inp + (1 - mask) * cur_inp
 
                 optimizer.zero_grad()
-                kw = self.block_kwargs  # shared per-block forward kwargs
+                # kwargs re-shaped to THIS batch size + block dtype every step.
+                kw = self._prep_kwargs(self.block_kwargs, cur_inp.size(0),
+                                       block_dtype, device)
                 with torch.cuda.amp.autocast(enabled=self.fp16):
-                    out = block_q(cur_inp.float(), **kw)
+                    out = block_q(cur_inp.to(block_dtype), **kw)
                     out = out[0] if isinstance(out, tuple) else out
-                    err = loss_func(out, cur_out)
+                    err = loss_func(out, cur_out.to(out.dtype))
                 scaler.scale(err).backward(retain_graph=False)
                 scaler.step(optimizer)
                 scheduler.step()
