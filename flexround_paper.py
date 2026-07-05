@@ -368,7 +368,8 @@ class CachedDataset(Dataset):
         with torch.no_grad():
             for i in range(num_samples):
                 x = self.cached_fp_input[i].to(self.device)
-                kw = self.cached_fp_other[i]
+                kw = {k: (v.to(self.device) if torch.is_tensor(v) else v)
+                      for k, v in self.cached_fp_other[i].items()}
                 out = fp_block(x, **kw)
                 out = out[0] if isinstance(out, tuple) else out
                 self.cached_fp_output.append(out.detach().to(self.device))
@@ -382,7 +383,8 @@ class CachedDataset(Dataset):
         with torch.no_grad():
             for i in range(num_samples):
                 x = self.cached_q_input[i].to(self.device)
-                kw = self.cached_fp_other[i]
+                kw = {k: (v.to(self.device) if torch.is_tensor(v) else v)
+                      for k, v in self.cached_fp_other[i].items()}
                 out = q_block(x, **kw)
                 out = out[0] if isinstance(out, tuple) else out
                 new_q.append(out.detach().to(self.device))
@@ -518,62 +520,76 @@ class FlexRoundREM:
         fp_model = self.fp_model
         device = self.device
 
-        layers = model.model.layers
-        fp_layers = fp_model.model.layers
+        layers = model.model.layers            # blockUnits    (quantizable)
+        fp_layers = fp_model.model.layers      # blockUnits_fp (frozen fp)
         n_blocks = model.config.num_hidden_layers
 
-        # ---- build fp kwargs fn (position_ids etc.) once from block-0 cache
         def block_kwargs_fn(other):
             return other
 
-        # ---- initial caching (block 0 in/out) via fp model ----------------
+        # ---- initial caching (block 0) : reference moves embed_tokens +
+        # layers[0] of fp_model to cuda, caches, then returns them to cpu. The
+        # rest of fp_model / model stays on CPU throughout (40GB-safe: only ONE
+        # block is on GPU at a time).
         print('Initial activation caching (block 0)')
         fp_model.model.embed_tokens = fp_model.model.embed_tokens.to(device)
-        fp_layers_local = fp_model.model.layers
-        cached = CachedDataset(fp_model, fp_layers_local, self.calib_ids,
+        if getattr(fp_model.model, 'rotary_emb', None) is not None:
+            fp_model.model.rotary_emb = fp_model.model.rotary_emb.to(device)
+        fp_layers[0] = fp_layers[0].to(device)
+        cached = CachedDataset(fp_model, fp_layers, self.calib_ids,
                                device, self.input_prob, self.num_samples,
                                block_kwargs_fn)
+        fp_layers[0] = fp_layers[0].to('cpu')
         fp_model.model.embed_tokens = fp_model.model.embed_tokens.to('cpu')
 
         for idx in tqdm(range(n_blocks), desc='blocks'):
             print('=' * 60)
             print(f'  Layer {idx} optimization start')
 
+            # 1. FP activation caching: advance clean stream through fp block idx.
+            #    reference: DataCacheWrapper(blockUnits_fp[idx]) -> to cuda in
+            #    fp_data_caching -> .cpu() after. Same here.
             if idx > 0:
-                # advance fp stream through fp block idx
-                cached.fp_data_caching(deepcopy(fp_layers[idx]).to(device),
-                                       self.num_samples)
+                cached.fp_data_caching(fp_layers[idx], self.num_samples)
 
-            # per-block forward kwargs (position_ids/mask) from cache
+            # per-block forward kwargs (position_ids / mask / rotary embeds),
+            # captured from the fp stream, replayed on the block we optimize.
             self.block_kwargs = {
                 k: (v.to(device) if torch.is_tensor(v) else v)
                 for k, v in cached.cached_fp_other[0].items()}
 
-            # independent block = the real (fp) decoder layer, deep-copied
-            block = deepcopy(fp_layers[idx]).to(device).float()
-
-            # swap linears -> INTLinear (FlexRound), reconstruct, dequantize
+            # 2/3. Independent block = the QUANTIZABLE block (self.model),
+            #      sub-modules moved to cuda, exactly like reference
+            #      (blockUnits[idx].self_attn.to('cuda:0') ...). No deepcopy:
+            #      we quantize the real block in place and keep it on GPU only
+            #      for this iteration.
+            block = layers[idx].to(device).float()
             block = self.quantizeBlock(block)
+
+            # 4. reconstruct  5. dequantize (in place)
             block = self.blockReconstruction(block, cached)
             block = self.dequantizeBlock(block.half())
 
-            # write the reconstructed (dequantized) linears back into model
-            for name in self._linear_names(fp_layers[idx]):
-                self._set_sub(layers[idx], name,
-                              self._get_sub(block, name).to(device))
+            # write dequantized linears back into self.model, on CPU (model
+            # lives on CPU; only the active block is transiently on GPU).
+            for name in self._linear_names(layers[idx]):
+                self._set_sub(layers[idx], name, self._get_sub(block, name))
+            layers[idx] = layers[idx].to('cpu')
             del block
+            gc.collect()
             torch.cuda.empty_cache()
 
-            # advance dirty stream through the newly-quantized block
+            # 6. Quantized activation caching: advance dirty stream through the
+            #    just-quantized block. reference wraps blockUnits[idx], moves to
+            #    cuda in q_data_caching, .cpu() after.
             if idx < n_blocks - 1:
-                cached.q_data_caching(deepcopy(layers[idx]).to(device),
-                                      self.num_samples)
-
-            # ---- per-block cleanup: drop this block's fp reference weights
-            # (the fp stream only needs fp_layers[idx+1] onward) and reclaim mem.
-            fp_layers[idx].to('cpu')
-            gc.collect()
-            if torch.cuda.is_available():
+                cached.q_data_caching(layers[idx], self.num_samples)
+            else:
+                # last block: park all cached activations on CPU (reference)
+                for i in range(len(cached.cached_fp_input)):
+                    cached.cached_fp_input[i] = cached.cached_fp_input[i].cpu()
+                    cached.cached_fp_output[i] = cached.cached_fp_output[i].cpu()
+                    cached.cached_q_input[i] = cached.cached_q_input[i].cpu()
                 torch.cuda.empty_cache()
 
         # ---- final cleanup: free the 3-stream cache + fp reference ---------

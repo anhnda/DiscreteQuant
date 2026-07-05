@@ -57,11 +57,15 @@ def main():
     print(f"Loading tokenizer + models from {args.model_path}")
     tok = AutoTokenizer.from_pretrained(args.model_path, use_fast=False)
 
-    # quantizable target
+    # Reference device model: BOTH models stay on CPU; only the block currently
+    # being cached/reconstructed is moved to GPU, then returned to CPU. We do NOT
+    # move the whole model to cuda (that breaks the per-block .cpu() invariant in
+    # the caching helpers and causes cuda/cpu mismatch mid-block).
+    # quantizable target (stays on CPU)
     model = AutoModelForCausalLM.from_pretrained(
         args.model_path, torch_dtype=torch.float16, low_cpu_mem_usage=True)
-    model.to(args.device).eval()
-    # frozen fp reference (clean stream). kept on CPU, moved block-by-block.
+    model.eval()
+    # frozen fp reference for the clean stream (stays on CPU)
     fp_model = AutoModelForCausalLM.from_pretrained(
         args.model_path, torch_dtype=torch.float16, low_cpu_mem_usage=True)
     fp_model.eval()
