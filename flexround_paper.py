@@ -479,24 +479,24 @@ class FlexRoundREM:
             self._set_sub(block, name, swapUniformQ(lin, **wq))
         return block
 
-    def dequantizeBlock(self, block, out_dtype=torch.float16):
-        for name in self._linear_names(block):
+    def dequantizeBlock(self, block):
+        # verbatim reference (REM_fast.dequantizeBlock): the block is passed in
+        # ALREADY .half()'d, so org_weight AND the delta params are fp16 -> the
+        # baked quantized_weight is fp16 too. We keep the INTLinear module and
+        # just bake weight_quantizer(org_weight) into .quantized_weight, then
+        # strip org_weight / delta1..5 / weight_quantizer. INTLinear.forward
+        # then uses quantized_weight directly (no quantizer call, no dtype drift).
+        for name in [n for n, m in block.named_modules()
+                     if isinstance(m, INTLinear)]:
             m = self._get_sub(block, name)
-            if isinstance(m, INTLinear):
-                # weight_quantizer(org_weight) may upcast to fp32 (delta params
-                # are fp32); force the deployed weight/bias to out_dtype so the
-                # whole block is a single dtype for downstream caching + save.
-                qw = m.weight_quantizer(m.org_weight).clone().detach().to(out_dtype)
-                new_lin = nn.Linear(m.org_weight.shape[1], m.org_weight.shape[0],
-                                    bias=(m.bias is not None))
-                new_lin.weight = nn.Parameter(qw, requires_grad=False)
-                if m.bias is not None:
-                    new_lin.bias = nn.Parameter(
-                        m.bias.detach().clone().to(out_dtype), requires_grad=False)
-                self._set_sub(block, name, new_lin.to(qw.device))
-        # cast the rest of the block (layernorms etc.) to the same dtype so the
-        # entire decoder layer is uniformly out_dtype.
-        block = block.to(out_dtype)
+            m.quantized_weight = nn.Parameter(
+                m.weight_quantizer(m.org_weight).clone().detach(),
+                requires_grad=False)
+            delattr(m, 'org_weight')
+            for i in range(5):
+                if hasattr(m.weight_quantizer, 'delta' + str(i + 1)):
+                    delattr(m.weight_quantizer, 'delta' + str(i + 1))
+            delattr(m, 'weight_quantizer')
         return block
 
     @staticmethod
@@ -562,14 +562,13 @@ class FlexRoundREM:
             for step, batch in enumerate(loader):
                 if epoch == epochs and step == remainder:
                     break
+                # reference: cur_inp = batch[0] (= cached_q_input, the dirty
+                # stream); batch[1] = cached_fp_output (target); batch[2] =
+                # cached_fp_input is NOT fed into the block (input_prob acts in
+                # the caching stage, not as a per-step fp/q mix). We feed the
+                # dirty q-input exactly like REM_fast.blockReconstruction.
                 cur_inp = batch[0].squeeze(1).to(device)
                 cur_out = batch[1].squeeze(1).to(device)
-                cur_fp_inp = batch[2].squeeze(1).to(device)
-                # input_prob mixing (reference): randomly use fp input
-                if self.input_prob < 1.0:
-                    mask = (torch.rand(cur_inp.size(0), 1, 1, device=device)
-                            < self.input_prob).float()
-                    cur_inp = mask * cur_fp_inp + (1 - mask) * cur_inp
 
                 optimizer.zero_grad()
                 # kwargs re-shaped to THIS batch size + block dtype every step.
@@ -579,7 +578,7 @@ class FlexRoundREM:
                     out = block_q(cur_inp.to(block_dtype), **kw)
                     out = out[0] if isinstance(out, tuple) else out
                     err = loss_func(out, cur_out.to(out.dtype))
-                scaler.scale(err).backward(retain_graph=False)
+                scaler.scale(err).backward(retain_graph=True)
                 scaler.step(optimizer)
                 scheduler.step()
                 scaler.update()
@@ -631,23 +630,23 @@ class FlexRoundREM:
                 k: (v.to(device) if torch.is_tensor(v) else v)
                 for k, v in cached.cached_fp_other[0].items()}
 
-            # 2/3. Independent block = the QUANTIZABLE block (self.model),
-            #      sub-modules moved to cuda, exactly like reference
-            #      (blockUnits[idx].self_attn.to('cuda:0') ...). No deepcopy:
-            #      we quantize the real block in place and keep it on GPU only
-            #      for this iteration.
-            block = layers[idx].to(device).float()
+            # 2/3. Independent block: deep-copy the quantizable decoder layer so
+            #      swap/quantize/reconstruct never mutate layers[idx] in place.
+            #      Reconstruct in fp32 on GPU (reference: .to('cuda').float()).
+            block = deepcopy(layers[idx]).to(device).float()
             block = self.quantizeBlock(block)
 
-            # 4. reconstruct  5. dequantize (in place)
+            # 4. reconstruct (fp32)  5. dequantize -- reference calls
+            #    dequantizeBlock(independentBlock.half(), idx): the block is
+            #    half()'d FIRST (org_weight + delta params all become fp16), then
+            #    quantized_weight is baked, so everything is uniformly fp16.
             block = self.blockReconstruction(block, cached)
-            block = self.dequantizeBlock(block, out_dtype=torch.float16)
+            block = self.dequantizeBlock(block.half())
 
-            # write dequantized linears back into self.model, on CPU (model
-            # lives on CPU; only the active block is transiently on GPU).
-            for name in self._linear_names(layers[idx]):
-                self._set_sub(layers[idx], name, self._get_sub(block, name))
-            layers[idx] = layers[idx].to('cpu')
+            # replace the ENTIRE decoder layer in self.model with the dequantized
+            # fp16 block. Park on CPU (model lives on CPU).
+            block = block.to('cpu')
+            layers[idx] = block
             del block
             gc.collect()
             torch.cuda.empty_cache()
