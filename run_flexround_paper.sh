@@ -33,7 +33,7 @@ echo "=== run started $(date) ==="
 echo "log: $LOG_FILE"
 
 # ---- reference defaults (run_clm.py) --------------------------------------
-BITS=4                 # reference n_bits_w default
+BITS=3                 # reference n_bits_w default
 ITERS=5000             # reference iters_w default
 N_CALIB=128
 SEQLEN=2048
