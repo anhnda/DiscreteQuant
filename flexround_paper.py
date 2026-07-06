@@ -479,24 +479,31 @@ class FlexRoundREM:
             self._set_sub(block, name, swapUniformQ(lin, **wq))
         return block
 
-    def dequantizeBlock(self, block):
-        # verbatim reference (REM_fast.dequantizeBlock): the block is passed in
-        # ALREADY .half()'d, so org_weight AND the delta params are fp16 -> the
-        # baked quantized_weight is fp16 too. We keep the INTLinear module and
-        # just bake weight_quantizer(org_weight) into .quantized_weight, then
-        # strip org_weight / delta1..5 / weight_quantizer. INTLinear.forward
-        # then uses quantized_weight directly (no quantizer call, no dtype drift).
+    def dequantizeBlock(self, block, out_dtype=torch.float16):
+        # The reference keeps INTLinear and bakes .quantized_weight because it
+        # evaluates the model IN MEMORY. This pipeline save_pretrained()s and
+        # reloads with AutoModelForCausalLM, which knows nothing about INTLinear
+        # and expects plain nn.Linear `.weight` -- so a baked `.quantized_weight`
+        # would serialize as an UNEXPECTED key and the real `.weight` would be
+        # MISSING, loading garbage weights (PPL blows up). We therefore convert
+        # each INTLinear back to a standard nn.Linear holding the dequantized
+        # weight, so the checkpoint is a normal Llama checkpoint.
+        #
+        # Block is passed in ALREADY .half()'d, so org_weight and delta params
+        # are fp16 and weight_quantizer(org_weight) is fp16. We still force
+        # out_dtype to be safe.
         for name in [n for n, m in block.named_modules()
                      if isinstance(m, INTLinear)]:
             m = self._get_sub(block, name)
-            m.quantized_weight = nn.Parameter(
-                m.weight_quantizer(m.org_weight).clone().detach(),
-                requires_grad=False)
-            delattr(m, 'org_weight')
-            for i in range(5):
-                if hasattr(m.weight_quantizer, 'delta' + str(i + 1)):
-                    delattr(m.weight_quantizer, 'delta' + str(i + 1))
-            delattr(m, 'weight_quantizer')
+            qw = m.weight_quantizer(m.org_weight).clone().detach().to(out_dtype)
+            new_lin = nn.Linear(qw.shape[1], qw.shape[0],
+                                bias=(m.bias is not None))
+            new_lin.weight = nn.Parameter(qw, requires_grad=False)
+            if m.bias is not None:
+                new_lin.bias = nn.Parameter(
+                    m.bias.detach().clone().to(out_dtype), requires_grad=False)
+            self._set_sub(block, name, new_lin.to(qw.device))
+        block = block.to(out_dtype)
         return block
 
     @staticmethod

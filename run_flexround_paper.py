@@ -105,6 +105,32 @@ def main():
         torch.cuda.ipc_collect()
     print("cleanup done (models freed, CUDA cache emptied)")
 
+    # ---- fast save/load sanity check (catches key mismatch + blow-up in
+    #      ~1 min, instead of waiting for the full eval_ppl run) -----------
+    print("\n[sanity] reloading checkpoint to verify keys + quick PPL ...")
+    reloaded = AutoModelForCausalLM.from_pretrained(
+        out, torch_dtype=torch.float16, low_cpu_mem_usage=True)
+    # any missing/unexpected keys were already printed by the loader; here we
+    # do a 4-window PPL to see if the model is sane at all.
+    reloaded.to(args.device).eval()
+    with torch.no_grad():
+        ids = tok("The quick brown fox jumps over the lazy dog. " * 200,
+                  return_tensors='pt').input_ids[:, :args.seqlen].to(args.device)
+        loss = reloaded(ids, labels=ids).loss
+        ppl = float(torch.exp(loss))
+    print(f"[sanity] quick PPL on a toy window = {ppl:.2f}")
+    if ppl > 1e3:
+        print("[sanity][WARN] PPL is huge -- the checkpoint is broken "
+              "(key mismatch or bad reconstruction). Do NOT trust the full "
+              "eval; inspect the LOAD REPORT above for UNEXPECTED/MISSING keys.")
+    else:
+        print("[sanity] checkpoint looks sane; full eval_ppl should be "
+              "meaningful.")
+    del reloaded
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
 
 if __name__ == "__main__":
     main()
