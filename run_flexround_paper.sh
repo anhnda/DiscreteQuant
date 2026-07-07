@@ -34,7 +34,7 @@ echo "log: $LOG_FILE"
 
 # ---- reference defaults (run_clm.py) --------------------------------------
 BITS=3                 # reference n_bits_w default
-ITERS=1000             # reference iters_w default
+ITERS=5000             # reference iters_w default
 N_CALIB=128
 SEQLEN=2048
 W_LR=1e-5              # reference w_lr default
