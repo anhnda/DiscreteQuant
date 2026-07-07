@@ -34,7 +34,7 @@ echo "log: $LOG_FILE"
 
 # ---- reference defaults (run_clm.py) --------------------------------------
 BITS=3                 # reference n_bits_w default
-ITERS=1000             # reference iters_w default
+ITERS=5000             # reference iters_w default
 N_CALIB=128
 SEQLEN=2048
 W_LR=1e-5              # reference w_lr default
@@ -42,6 +42,9 @@ INPUT_PROB=0.5         # reference input_prob default
 CALIB_DATASET=c4
 # channel-wise per-channel weight quant (reference LLaMA uses --channel_wise).
 CHANNEL_FLAG="--channel-wise"     # use "--per-tensor" for per-tensor grid
+# group-wise weight quant. 128 matches the layer-wise flexround --group-size and
+# gives a much finer 3-bit grid than per-channel (0 = per-channel = reference).
+GROUP_SIZE=128
 
 CELL_DIR="$OUTPUT_DIR/flexround_paper_${BITS}bit"
 
@@ -58,6 +61,7 @@ python run_flexround_paper.py \
   --n-calib $N_CALIB --seqlen $SEQLEN \
   --w-lr $W_LR --input-prob $INPUT_PROB \
   --calib-dataset $CALIB_DATASET \
+  --group-size $GROUP_SIZE \
   $CHANNEL_FLAG
 
 if [ ! -d "$CELL_DIR" ]; then

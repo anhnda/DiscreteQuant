@@ -59,7 +59,7 @@ class UniformAffineQuantizer(nn.Module):
     def __init__(self, n_bits: int = 4, symmetric: bool = False,
                  clipping: bool = True, channel_wise: bool = False,
                  scale_method: str = 'mse', mode: str = 'flexround',
-                 org_weight=None):
+                 group_size: int = 0, org_weight=None):
         super().__init__()
         self.sym = symmetric
         self.clipping = clipping
@@ -76,6 +76,13 @@ class UniformAffineQuantizer(nn.Module):
         self.delta4 = None
         self.delta5 = None
         self.channel_wise = channel_wise
+        # group_size > 0 -> group-wise weight quant: each row [C, K] is split
+        # into K/group_size contiguous groups, each with its own scale/zp. We
+        # implement it by reshaping the weight to [C * K/group_size, group_size]
+        # and running the existing per-channel init/search on that view, so one
+        # "row" of the view == one group. group_size == 0 keeps per-channel
+        # (whole row) as in the reference.
+        self.group_size = int(group_size)
         self.eps = torch.tensor(1e-8, dtype=torch.float32)
         self.scale_method = scale_method
         self.one_side_dist = None
@@ -84,31 +91,69 @@ class UniformAffineQuantizer(nn.Module):
         self.running_max = None
 
         if not self.inited:
+            self.out_features, self.in_features = org_weight.shape
+            if self.group_size and self.in_features % self.group_size == 0:
+                self.n_groups = self.in_features // self.group_size
+            else:
+                self.group_size = 0            # fall back to per-channel
+                self.n_groups = 1
+
+            w_view = self._to_group_view(org_weight.detach())   # [C*ng, g] or [C,K]
+            # per-channel init on the (possibly grouped) view: one scale per row
             self.delta, self.zero_point = self.init_quantization_scale(
-                org_weight.detach(), self.channel_wise)
+                w_view, channel_wise=True)
             if self.mode == 'flexround':
+                # delta1 = log(s1): per-group grid size, broadcast back to weight
+                # shape on the fly in forward. Store in grouped-row shape.
                 self.delta1 = nn.Parameter(torch.log(self.delta).detach())
+                # delta2 = S2: per-element, full weight shape [C, K].
                 self.delta2 = nn.Parameter(torch.zeros_like(org_weight))
+                # delta3 = s3: per-output-channel [C, 1].
                 self.delta3 = nn.Parameter(
                     torch.zeros_like(org_weight[:, 0].unsqueeze(-1)))
+                # zero_point as a buffer so .half()/.to() cast it with the module
+                # (it's used in forward's clamp and must match delta dtype).
+                if not torch.is_tensor(self.zero_point):
+                    self.zero_point = torch.tensor(self.zero_point)
+                self.register_buffer('zp_buf', self.zero_point.detach().clone())
             else:
                 raise NotImplementedError("this port runs mode='flexround' only")
             self.inited = True
 
+    # ---- group reshape helpers -------------------------------------------
+    def _to_group_view(self, w):
+        """[C, K] -> [C * n_groups, group_size] (contiguous groups) or [C, K]."""
+        if not self.group_size:
+            return w
+        C, K = w.shape
+        return w.reshape(C * self.n_groups, self.group_size)
+
+    def _grouped_scale_to_weight(self, s_grouped):
+        """[C*ng, 1] grid params -> broadcast to weight shape [C, K]."""
+        if not self.group_size:
+            # per-channel: delta is [C,1] -> broadcasts over K directly
+            return s_grouped
+        C = self.out_features
+        # s_grouped is [C*ng, 1] -> [C, ng] -> repeat_interleave to [C, K]
+        s = s_grouped.reshape(C, self.n_groups)
+        return s.repeat_interleave(self.group_size, dim=1)
+
     def forward(self, x: torch.Tensor):
-        # divisor = exp(delta1 + delta2 + delta3)  (S = s1 . S2 . s3, in log)
+        # broadcast the per-group grid size (delta1) and zero_point up to the
+        # full weight shape [C, K]; delta2 is already [C, K], delta3 is [C, 1].
+        d1 = self._grouped_scale_to_weight(self.delta1)          # [C, K]
+        s1 = d1.exp()
+        divisor = (d1 + self.delta2 + self.delta3).exp()         # s1 . S2 . s3
         if not self.sym:
-            x_int = round_ste.apply(
-                x / (self.delta1 + self.delta2 + self.delta3).exp())
-            x_quant = torch.clamp(x_int, -self.zero_point,
-                                  self.n_levels - 1 - self.zero_point)
-            x_dequant = x_quant * self.delta1.exp()
+            zp = self._grouped_scale_to_weight(self.zp_buf)      # [C, K]
+            x_int = round_ste.apply(x / divisor)
+            x_quant = torch.clamp(x_int, -zp, self.n_levels - 1 - zp)
+            x_dequant = x_quant * s1
         else:
-            x_int = round_ste.apply(
-                x / (self.delta1 + self.delta2 + self.delta3).exp())
+            x_int = round_ste.apply(x / divisor)
             x_quant = torch.clamp(x_int, -2 ** (self.n_bits - 1),
                                   2 ** (self.n_bits - 1) - 1)
-            x_dequant = x_quant * self.delta1.exp()
+            x_dequant = x_quant * s1
         return x_dequant
 
     # ---- grid init (RTN/MSE search) : verbatim ---------------------------
@@ -228,13 +273,14 @@ class UniformAffineQuantizer(nn.Module):
 # ============================================================================ #
 class INTLinear(nn.Module):
     def __init__(self, org_weight, n_bits=4, symmetric=False, clipping=True,
-                 channel_wise=True, mode='flexround', bias=None):
+                 channel_wise=True, mode='flexround', group_size=0, bias=None):
         super().__init__()
         self.org_weight = org_weight
         self.quantized_weight = None
         self.weight_quantizer = UniformAffineQuantizer(
             n_bits=n_bits, symmetric=symmetric, clipping=clipping,
-            channel_wise=channel_wise, mode=mode, org_weight=org_weight)
+            channel_wise=channel_wise, mode=mode, group_size=group_size,
+            org_weight=org_weight)
         if bias is not None:
             self.bias = nn.Parameter(bias)
         else:
@@ -249,12 +295,12 @@ class INTLinear(nn.Module):
 
 
 def swapUniformQ(layer, n_bits, channel_wise=True, mode='flexround',
-                 symmetric=False, clipping=True):
+                 symmetric=False, clipping=True, group_size=0):
     weight = layer.weight
     bias = layer.bias if layer.bias is not None else None
     return INTLinear(org_weight=weight, n_bits=n_bits, symmetric=symmetric,
                      clipping=clipping, channel_wise=channel_wise, mode=mode,
-                     bias=bias)
+                     group_size=group_size, bias=bias)
 
 
 # ============================================================================ #
@@ -433,8 +479,8 @@ class CachedDataset(Dataset):
 class FlexRoundREM:
     def __init__(self, model, fp_model, calib_ids, *, n_bits=4, iters=5000,
                  num_samples=128, w_lr=1e-5, input_prob=0.5, channel_wise=True,
-                 symmetric=False, clipping=True, mode='flexround', fp16=False,
-                 device='cuda:0'):
+                 symmetric=False, clipping=True, mode='flexround', group_size=0,
+                 fp16=False, device='cuda:0'):
         self.model = model
         self.fp_model = fp_model
         self.calib_ids = calib_ids
@@ -447,6 +493,7 @@ class FlexRoundREM:
         self.symmetric = symmetric
         self.clipping = clipping
         self.mode = mode
+        self.group_size = int(group_size)
         self.fp16 = fp16
         self.device = device
 
@@ -473,7 +520,7 @@ class FlexRoundREM:
     def quantizeBlock(self, block):
         wq = {'n_bits': self.n_bits, 'channel_wise': self.channel_wise,
               'mode': self.mode, 'symmetric': self.symmetric,
-              'clipping': self.clipping}
+              'clipping': self.clipping, 'group_size': self.group_size}
         for name in self._linear_names(block):
             lin = self._get_sub(block, name)
             self._set_sub(block, name, swapUniformQ(lin, **wq))

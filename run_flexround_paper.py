@@ -47,6 +47,10 @@ def main():
     p.add_argument('--seed', type=int, default=42)
     p.add_argument('--channel-wise', action='store_true', default=True)
     p.add_argument('--per-tensor', dest='channel_wise', action='store_false')
+    p.add_argument('--group-size', type=int, default=0,
+                   help="group-wise weight quant (e.g. 128). 0 = per-channel "
+                        "(reference default). Group-wise gives a finer grid, "
+                        "matching the layer-wise flexround --group-size setting.")
     p.add_argument('--symmetric', action='store_true', default=False)
     p.add_argument('--fp16', action='store_true', default=False)
     p.add_argument('--device', default='cuda:0')
@@ -85,7 +89,8 @@ def main():
         n_bits=args.bits, iters=args.iters, num_samples=n_calib,
         w_lr=args.w_lr, input_prob=args.input_prob,
         channel_wise=args.channel_wise, symmetric=args.symmetric,
-        clipping=True, mode='flexround', fp16=args.fp16, device=args.device)
+        clipping=True, mode='flexround', group_size=args.group_size,
+        fp16=args.fp16, device=args.device)
 
     print("Running FlexRound block-wise reconstruction ...")
     model = rem.quantization()
