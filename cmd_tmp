@@ -140,5 +140,14 @@ Wrote ./quantized_models/flexround_llama3_3bit/rtn_flexround/ppl.json
 >>> [3/3] deleting ./quantized_models/flexround_llama3_3bit/rtn_flexround
 <<< done rtn+flexround
 
+SUMMARY  flexround_paper_3bit 1000it  
+SUMMARY  flexround_paper_3bit wikitext2=9.5924 | c4=12.2889                                            
+Wrote ./quantized_models/flexround_paper_llama3_4bit/flexround_paper_3bit/ppl.json                      
+>>> [2.5] preserving ppl.json                                                                           
+>>> [3/3] cleanup: deleting checkpoint ./quantized_models/flexround_paper_llama3_4bit/flexround_paper_3bit                        
+
+flexround_paper_3bit 5000 it
+                       
+SUMMARY  flexround_paper_3bit  wikitext2=8.2009 | c4=10.7169
 
 
