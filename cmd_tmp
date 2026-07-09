@@ -151,3 +151,12 @@ flexround_paper_3bit 5000 it
 SUMMARY  flexround_paper_3bit  wikitext2=8.2009 | c4=10.7169
 
 
+Mistral 
+SUMMARY  rtn_flexround  wikitext2=5.7696 | c4=8.3671
+Wrote ./quantized_models/flexround_llama3_3bit/rtn_flexround/ppl.json
+>>> [2.5] preserving ppl.json
+>>> [3/3] deleting ./quantized_models/flexround_llama3_3bit/rtn_flexround
+<<< done rtn+flexround
+
+
+
