@@ -158,5 +158,6 @@ Wrote ./quantized_models/flexround_llama3_3bit/rtn_flexround/ppl.json
 >>> [3/3] deleting ./quantized_models/flexround_llama3_3bit/rtn_flexround
 <<< done rtn+flexround
 
-
+FlexRound_Paper
+SUMMARY  flexround_paper_3bit  wikitext2=6.0191 | c4=8.6753
 
