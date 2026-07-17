@@ -22,7 +22,7 @@ LOG_FILE="$LOG_DIR/flexround_paper_gw_$(date +%Y%m%d_%H%M%S).log"
 exec > >(tee -a "$LOG_FILE") 2>&1
 echo "=== run started $(date) ==="
 
-BITS=4
+BITS=3
 ITERS=5000
 N_CALIB=128
 SEQLEN=2048

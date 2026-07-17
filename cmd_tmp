@@ -152,12 +152,10 @@ SUMMARY  flexround_paper_3bit  wikitext2=8.2009 | c4=10.7169
 
 
 Mistral 
-SUMMARY  rtn_flexround  wikitext2=5.7696 | c4=8.3671
-Wrote ./quantized_models/flexround_llama3_3bit/rtn_flexround/ppl.json
->>> [2.5] preserving ppl.json
->>> [3/3] deleting ./quantized_models/flexround_llama3_3bit/rtn_flexround
-<<< done rtn+flexround
+SUMMARY  rtn_flexround_symmetric  wikitext2=5.7696 | c4=8.3671
 
-FlexRound_Paper
+FlexRound_Paper_nogroupwise
 SUMMARY  flexround_paper_3bit  wikitext2=6.0191 | c4=8.6753
 
+flexround_paper_gw128
+SUMMARY  flexround_paper_4bit  wikitext2=5.4763 | c4=7.9537
